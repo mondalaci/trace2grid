@@ -41,7 +41,7 @@ Detection quality is tuned against labeled ground truth in `training/`: each pho
 To label photos, drop them into `training/`, run `npm run dev`, and open `http://localhost:5173/train.html`:
 
 1. Pick the photo, drag the paper corners exactly onto the sheet edges (wheel zooms, middle-drag pans).
-2. "Label tools →" seeds the blue outline from the current detector; left-drag adds area, right-drag carves away (shadows, gaps).
+2. "Label tools →" seeds the blue outline from the current detector; drag vertices to move them, double-click an edge to insert a vertex, right-click a vertex to delete it.
 3. Everything autosaves to `training/<photo>.json`.
 
 Contributions of tricky photos (shiny tools, harsh shadows, unusual paper/backgrounds) with corrected labels are welcome — submit both files in a PR. Please strip EXIF GPS data first, e.g. `exiftool -gps:all= training/*.jpg`.

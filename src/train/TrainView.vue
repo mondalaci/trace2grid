@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, triggerRef, watch } from 'vue'
 import { extractToolContours, type ExtractedContour } from '../lib/scan/contours'
 import { loadOpenCV } from '../lib/scan/opencv'
 import {
@@ -9,7 +9,7 @@ import {
   paperById,
   rectifyPaper,
 } from '../lib/scan/paper'
-import { polygonToSvgPoints, svgEventPoint } from '../lib/svg'
+import { polygonToSvgPoints, svgClientPoint, svgEventPoint } from '../lib/svg'
 import type { PaperSizeId, Vec2 } from '../types'
 import type { TrainingAnnotation, TruthPolygon } from './format'
 
@@ -45,24 +45,23 @@ const rectifiedW = ref(0)
 const rectifiedH = ref(0)
 const regionsSvg = ref<SVGSVGElement | null>(null)
 const viewBox = reactive({ x: 0, y: 0, w: 100, h: 100 })
-const lasso = ref<{ mode: 'add' | 'remove'; pointsPx: Vec2[] } | null>(null)
-const hoverPoint = ref<Vec2 | null>(null)
 let panLast: Vec2 | null = null
-let lassoButtonDown = false
 
-// Ground truth lives in a raster mask; the outline shown to the user (and
-// persisted) is re-vectorized from it after every edit.
-const truthCanvas = document.createElement('canvas')
-let truthCtx: CanvasRenderingContext2D | null = null
-let seededFor = ''
-const truthPolysPx = ref<{ outer: Vec2[]; holes: Vec2[][] }[]>([])
-const undoStack: ImageData[] = []
+type TruthPoly = { outer: Vec2[]; holes: Vec2[][] }
+/** hole = -1 → outer ring; otherwise index into holes. */
+type RingLoc = { poly: number; hole: number }
+type VertDrag = RingLoc & { idx: number }
+
+const truthPolysPx = ref<TruthPoly[]>([])
+const undoStack: TruthPoly[][] = []
 const undoDepth = ref(0)
-const redoStack: ImageData[] = []
+const redoStack: TruthPoly[][] = []
 const redoDepth = ref(0)
 let savedTruth: TruthPolygon[] | null = null
-/** Bumped on photo switch and every outline rebuild so stale async work is ignored. */
+let seededFor = ''
+/** Bumped on photo switch so stale async extraction is ignored. */
 let truthEpoch = 0
+let draggingVert: VertDrag | null = null
 
 const sensitivity = ref(0)
 const showDetection = ref(false)
@@ -77,6 +76,9 @@ let loading = false
 
 const viewBoxAttr = computed(() => `${viewBox.x} ${viewBox.y} ${viewBox.w} ${viewBox.h}`)
 const strokePx = computed(() => viewBox.w / 300)
+const vertexR = computed(() => viewBox.w / 280)
+/** Invisible hit target — larger than the drawn handle for easier grabbing. */
+const vertexHitR = computed(() => Math.max(vertexR.value * 4, viewBox.w / 70))
 const cornersViewBoxAttr = computed(
   () => `${cornersViewBox.x} ${cornersViewBox.y} ${cornersViewBox.w} ${cornersViewBox.h}`,
 )
@@ -95,20 +97,45 @@ function zoomAt(vb: ViewBox, svg: SVGSVGElement, event: WheelEvent, fullW: numbe
 }
 
 function panBy(vb: ViewBox, svg: SVGSVGElement, event: PointerEvent, last: Vec2): Vec2 {
-  const rect = svg.getBoundingClientRect()
-  vb.x -= ((event.clientX - last[0]) * vb.w) / rect.width
-  vb.y -= ((event.clientY - last[1]) * vb.h) / rect.height
+  // Use the screen CTM so letterboxed `meet` scaling matches 1:1 with the cursor
+  // (dividing by the element rect over-damps pan when the image doesn't fill the SVG).
+  const [x0, y0] = svgClientPoint(svg, last[0], last[1])
+  const [x1, y1] = svgClientPoint(svg, event.clientX, event.clientY)
+  vb.x -= x1 - x0
+  vb.y -= y1 - y0
   return [event.clientX, event.clientY]
 }
 
-function truthPathD(poly: { outer: Vec2[]; holes: Vec2[][] }): string {
+function truthPathD(poly: TruthPoly): string {
   const ring = (pts: Vec2[]) =>
     pts.map(([x, y], i) => `${i ? 'L' : 'M'}${x.toFixed(1)} ${y.toFixed(1)}`).join('') + 'Z'
   return ring(poly.outer) + poly.holes.map(ring).join('')
 }
 
+function clonePolys(polys: TruthPoly[]): TruthPoly[] {
+  return polys.map((p) => ({
+    outer: p.outer.map((v) => [v[0], v[1]] as Vec2),
+    holes: p.holes.map((h) => h.map((v) => [v[0], v[1]] as Vec2)),
+  }))
+}
+
+function getRing(loc: RingLoc): Vec2[] | null {
+  const poly = truthPolysPx.value[loc.poly]
+  if (!poly) return null
+  return loc.hole < 0 ? poly.outer : (poly.holes[loc.hole] ?? null)
+}
+
+function fillRings(ctx: CanvasRenderingContext2D, rings: Vec2[][]) {
+  const path = new Path2D()
+  for (const ring of rings) {
+    ring.forEach(([x, y], i) => (i ? path.lineTo(x, y) : path.moveTo(x, y)))
+    path.closePath()
+  }
+  ctx.fillStyle = '#fff'
+  ctx.fill(path, 'evenodd')
+}
+
 onMounted(async () => {
-  window.addEventListener('keyup', onKeyUp)
   window.addEventListener('keydown', onKeyDown)
   window.addEventListener('beforeunload', onBeforeUnload)
   const res = await fetch('/__training/photos')
@@ -119,7 +146,6 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
-  window.removeEventListener('keyup', onKeyUp)
   window.removeEventListener('keydown', onKeyDown)
   window.removeEventListener('beforeunload', onBeforeUnload)
 })
@@ -159,21 +185,15 @@ async function selectPhoto(name: string) {
   loading = true
   seededFor = ''
   savedTruth = null
-  // Invalidate in-flight outline refreshes / extractions from the previous photo
-  // so they can't paint or autosave under the new name.
-  truthEpoch++
-  truthPolysPx.value = []
-  detected.value = []
-  iou.value = null
   undoStack.length = 0
   undoDepth.value = 0
   redoStack.length = 0
   redoDepth.value = 0
-  lasso.value = null
-  hoverPoint.value = null
-  truthCtx = null
-  truthCanvas.width = 0
-  truthCanvas.height = 0
+  draggingVert = null
+  truthPolysPx.value = []
+  detected.value = []
+  iou.value = null
+  truthEpoch++
   try {
     const blob = await (await fetch(`/__training/photo/${encodeURIComponent(name)}`)).blob()
     const bitmap = await createImageBitmap(blob)
@@ -293,7 +313,7 @@ async function toRegions() {
 
     const seedKey = `${selectedPhoto.value}:${canvas.width}x${canvas.height}`
     if (seededFor !== seedKey) {
-      await seedTruth(savedTruth)
+      seedTruth(savedTruth)
       seededFor = seedKey
     }
     phase.value = 'regions'
@@ -305,232 +325,199 @@ async function toRegions() {
   }
 }
 
-// --- truth mask management ---
-function fillRings(ctx: CanvasRenderingContext2D, rings: Vec2[][], erase = false) {
-  const path = new Path2D()
-  for (const ring of rings) {
-    ring.forEach(([x, y], i) => (i ? path.lineTo(x, y) : path.moveTo(x, y)))
-    path.closePath()
-  }
-  ctx.globalCompositeOperation = erase ? 'destination-out' : 'source-over'
-  ctx.fillStyle = '#fff'
-  ctx.fill(path, 'evenodd')
-  ctx.globalCompositeOperation = 'source-over'
-}
-
-async function seedTruth(fromSaved: TruthPolygon[] | null) {
-  const epoch = ++truthEpoch
-  truthCanvas.width = rectifiedW.value
-  truthCanvas.height = rectifiedH.value
-  truthCtx = truthCanvas.getContext('2d', { willReadFrequently: true })!
+// --- truth polygon editing ---
+function seedTruth(fromSaved: TruthPolygon[] | null) {
   undoStack.length = 0
   undoDepth.value = 0
   redoStack.length = 0
   redoDepth.value = 0
-  if (fromSaved) {
-    for (const poly of fromSaved) {
-      fillRings(truthCtx, [
-        poly.outerMm.map(([x, y]) => [x * PX_PER_MM, y * PX_PER_MM] as Vec2),
-        ...poly.holesMm.map((h) => h.map(([x, y]) => [x * PX_PER_MM, y * PX_PER_MM] as Vec2)),
-      ])
-    }
+  if (fromSaved?.length) {
+    truthPolysPx.value = fromSaved.map((poly) => ({
+      outer: poly.outerMm.map(([x, y]) => [x * PX_PER_MM, y * PX_PER_MM] as Vec2),
+      holes: poly.holesMm.map((h) => h.map(([x, y]) => [x * PX_PER_MM, y * PX_PER_MM] as Vec2)),
+    }))
   } else {
-    for (const contour of detected.value) fillRings(truthCtx, [contour.pointsPx])
+    truthPolysPx.value = detected.value.map((c) => ({
+      outer: c.pointsPx.map(([x, y]) => [x, y] as Vec2),
+      holes: [],
+    }))
   }
-  await refreshTruthOutline(epoch)
-}
-
-async function refreshTruthOutline(existingEpoch?: number) {
-  if (!truthCtx) return
-  const epoch = existingEpoch ?? ++truthEpoch
-  try {
-    await refreshTruthOutlineInner(epoch)
-  } catch (e) {
-    if (epoch === truthEpoch) {
-      error.value = `Outline update failed: ${e instanceof Error ? e.message : e}`
-    }
-  }
-}
-
-async function refreshTruthOutlineInner(epoch: number) {
-  // Snapshot the mask up front so a later seedTruth resize of truthCanvas
-  // can't make this job read the next photo's pixels.
-  const w = truthCanvas.width
-  const h = truthCanvas.height
-  if (!truthCtx || w === 0 || h === 0) return
-  const img = truthCtx.getImageData(0, 0, w, h)
-  const maskData = new Uint8Array(w * h)
-  for (let i = 0; i < w * h; i++) maskData[i] = img.data[i * 4 + 3] > 127 ? 255 : 0
-
-  const cv = await loadOpenCV()
-  if (epoch !== truthEpoch) return
-
-  const mask = cv.matFromArray(h, w, cv.CV_8UC1, maskData as unknown as number[])
-  const contours = new cv.MatVector()
-  const hierarchy = new cv.Mat()
-  try {
-    cv.findContours(mask, contours, hierarchy, cv.RETR_CCOMP, cv.CHAIN_APPROX_SIMPLE)
-    const rings: { pts: Vec2[]; parent: number }[] = []
-    for (let i = 0; i < contours.size(); i++) {
-      const approx = new cv.Mat()
-      try {
-        cv.approxPolyDP(contours.get(i), approx, 0.3 * PX_PER_MM, true)
-        const pts: Vec2[] = []
-        for (let p = 0; p < approx.rows; p++) {
-          pts.push([approx.data32S[p * 2], approx.data32S[p * 2 + 1]])
-        }
-        rings.push({ pts, parent: hierarchy.data32S[i * 4 + 3] })
-      } finally {
-        approx.delete()
-      }
-    }
-    const polys: { outer: Vec2[]; holes: Vec2[][] }[] = []
-    const outerIndex = new Map<number, number>()
-    rings.forEach((ring, i) => {
-      if (ring.parent === -1 && ring.pts.length >= 3) {
-        outerIndex.set(i, polys.length)
-        polys.push({ outer: ring.pts, holes: [] })
-      }
-    })
-    rings.forEach((ring) => {
-      if (ring.parent !== -1 && ring.pts.length >= 3) {
-        const target = outerIndex.get(ring.parent)
-        if (target !== undefined) polys[target].holes.push(ring.pts)
-      }
-    })
-    if (epoch !== truthEpoch) return
-    truthPolysPx.value = polys
-  } finally {
-    mask.delete()
-    contours.delete()
-    hierarchy.delete()
-  }
-  if (epoch !== truthEpoch) return
   scheduleSave()
   computeIoU()
 }
 
 function pushUndo() {
-  if (!truthCtx) return
-  undoStack.push(truthCtx.getImageData(0, 0, truthCanvas.width, truthCanvas.height))
+  undoStack.push(clonePolys(truthPolysPx.value))
   if (undoStack.length > MAX_UNDO) undoStack.shift()
   undoDepth.value = undoStack.length
-  // A new edit branches the history — drop any redo trail.
   redoStack.length = 0
   redoDepth.value = 0
 }
 
-function applyLasso(mode: 'add' | 'remove', pointsPx: Vec2[]) {
-  if (!truthCtx) return
-  pushUndo()
-  fillRings(truthCtx, [pointsPx], mode === 'remove')
-  refreshTruthOutline()
+function commitEdit() {
+  scheduleSave()
+  computeIoU()
 }
 
 function undoEdit() {
   const snapshot = undoStack.pop()
-  if (!snapshot || !truthCtx) return
-  redoStack.push(truthCtx.getImageData(0, 0, truthCanvas.width, truthCanvas.height))
+  if (!snapshot) return
+  redoStack.push(clonePolys(truthPolysPx.value))
   redoDepth.value = redoStack.length
   undoDepth.value = undoStack.length
-  truthCtx.putImageData(snapshot, 0, 0)
-  refreshTruthOutline()
+  truthPolysPx.value = snapshot
+  commitEdit()
 }
 
 function redoEdit() {
   const snapshot = redoStack.pop()
-  if (!snapshot || !truthCtx) return
-  undoStack.push(truthCtx.getImageData(0, 0, truthCanvas.width, truthCanvas.height))
+  if (!snapshot) return
+  undoStack.push(clonePolys(truthPolysPx.value))
   if (undoStack.length > MAX_UNDO) undoStack.shift()
   undoDepth.value = undoStack.length
   redoDepth.value = redoStack.length
-  truthCtx.putImageData(snapshot, 0, 0)
-  refreshTruthOutline()
+  truthPolysPx.value = snapshot
+  commitEdit()
 }
 
 function resetToDetection() {
-  if (!truthCtx) return
   pushUndo()
-  truthCtx.clearRect(0, 0, truthCanvas.width, truthCanvas.height)
-  for (const contour of detected.value) fillRings(truthCtx, [contour.pointsPx])
-  refreshTruthOutline()
+  truthPolysPx.value = detected.value.map((c) => ({
+    outer: c.pointsPx.map(([x, y]) => [x, y] as Vec2),
+    holes: [],
+  }))
+  commitEdit()
 }
 
-// --- zoom / pan / lasso ---
+function projectOnSegment(
+  p: Vec2,
+  a: Vec2,
+  b: Vec2,
+): { point: Vec2; t: number; dist: number } {
+  const abx = b[0] - a[0]
+  const aby = b[1] - a[1]
+  const len2 = abx * abx + aby * aby
+  if (len2 < 1e-9) return { point: [a[0], a[1]], t: 0, dist: Math.hypot(p[0] - a[0], p[1] - a[1]) }
+  const t = Math.max(0, Math.min(1, ((p[0] - a[0]) * abx + (p[1] - a[1]) * aby) / len2))
+  const point: Vec2 = [a[0] + abx * t, a[1] + aby * t]
+  return { point, t, dist: Math.hypot(p[0] - point[0], p[1] - point[1]) }
+}
+
+function nearestEdge(
+  p: Vec2,
+): (RingLoc & { idx: number; point: Vec2 }) | null {
+  const maxDist = viewBox.w / 40
+  let bestPoly = -1
+  let bestHole = -1
+  let bestIdx = -1
+  let bestPoint: Vec2 = [0, 0]
+  let bestDist = maxDist
+  for (let polyI = 0; polyI < truthPolysPx.value.length; polyI++) {
+    const poly = truthPolysPx.value[polyI]
+    const rings: { hole: number; pts: Vec2[] }[] = [
+      { hole: -1, pts: poly.outer },
+      ...poly.holes.map((pts, hole) => ({ hole, pts })),
+    ]
+    for (const { hole, pts } of rings) {
+      for (let i = 0; i < pts.length; i++) {
+        const a = pts[i]
+        const b = pts[(i + 1) % pts.length]
+        const hit = projectOnSegment(p, a, b)
+        if (hit.t < 0.05 || hit.t > 0.95) continue
+        if (hit.dist >= bestDist) continue
+        bestDist = hit.dist
+        bestPoly = polyI
+        bestHole = hole
+        bestIdx = i
+        bestPoint = hit.point
+      }
+    }
+  }
+  if (bestPoly < 0) return null
+  return { poly: bestPoly, hole: bestHole, idx: bestIdx, point: bestPoint }
+}
+
+function onVertDown(loc: VertDrag, event: PointerEvent) {
+  if (event.button === 2) {
+    event.preventDefault()
+    event.stopPropagation()
+    deleteVertex(loc)
+    return
+  }
+  if (event.button !== 0 || !regionsSvg.value) return
+  event.preventDefault()
+  event.stopPropagation()
+  regionsSvg.value.setPointerCapture(event.pointerId)
+  pushUndo()
+  draggingVert = loc
+}
+
+function onVertMove(event: PointerEvent) {
+  if (!draggingVert || !regionsSvg.value) return
+  const ring = getRing(draggingVert)
+  if (!ring) return
+  const [x, y] = svgEventPoint(regionsSvg.value, event)
+  ring[draggingVert.idx] = [x, y]
+  triggerRef(truthPolysPx)
+}
+
+function onVertUp() {
+  if (!draggingVert) return
+  draggingVert = null
+  commitEdit()
+}
+
+function deleteVertex(loc: VertDrag) {
+  const ring = getRing(loc)
+  if (!ring || ring.length <= 3) return
+  pushUndo()
+  ring.splice(loc.idx, 1)
+  triggerRef(truthPolysPx)
+  commitEdit()
+}
+
+function onRegionsDblClick(event: MouseEvent) {
+  if (!regionsSvg.value) return
+  const p = svgEventPoint(regionsSvg.value, event)
+  const edge = nearestEdge(p)
+  if (!edge) return
+  const ring = getRing(edge)
+  if (!ring) return
+  pushUndo()
+  ring.splice(edge.idx + 1, 0, edge.point)
+  triggerRef(truthPolysPx)
+  commitEdit()
+}
+
+// --- zoom / pan ---
 function onWheel(event: WheelEvent) {
   if (regionsSvg.value) zoomAt(viewBox, regionsSvg.value, event, rectifiedW.value)
 }
 
 function onRegionsDown(event: PointerEvent) {
   if (!regionsSvg.value) return
-  event.preventDefault()
-  regionsSvg.value.setPointerCapture(event.pointerId)
   if (event.button === 1) {
+    event.preventDefault()
+    regionsSvg.value.setPointerCapture(event.pointerId)
     panLast = [event.clientX, event.clientY]
-  } else if (event.button === 0 || event.button === 2) {
-    const p = svgEventPoint(regionsSvg.value, event)
-    lassoButtonDown = true
-    if (lasso.value) {
-      // Selection kept open with Shift: a click appends a straight segment.
-      lasso.value.pointsPx.push(p)
-    } else {
-      const mode = event.button === 0 ? 'add' : 'remove'
-      lasso.value = { mode, pointsPx: [p] }
-    }
   }
 }
 
 function onRegionsMove(event: PointerEvent) {
   if (!regionsSvg.value) return
-  if (panLast) {
-    panLast = panBy(viewBox, regionsSvg.value, event, panLast)
+  if (draggingVert) {
+    onVertMove(event)
     return
   }
-  if (lasso.value) {
-    const p = svgEventPoint(regionsSvg.value, event)
-    hoverPoint.value = p
-    // Freehand only while a lasso button is actually held down; while the
-    // Shift-held selection hovers, the dashed preview segment follows instead.
-    if (event.buttons & 3) {
-      const pts = lasso.value.pointsPx
-      const [lx, ly] = pts[pts.length - 1]
-      if (Math.hypot(p[0] - lx, p[1] - ly) > viewBox.w / 400) pts.push(p)
-    }
-  }
+  if (panLast) panLast = panBy(viewBox, regionsSvg.value, event, panLast)
 }
 
-function onRegionsUp(event: PointerEvent) {
+function onRegionsUp() {
+  if (draggingVert) onVertUp()
   panLast = null
-  lassoButtonDown = false
-  if (!lasso.value) return
-  if (event.shiftKey) return // Shift keeps the selection open
-  finishLasso()
-}
-
-function finishLasso() {
-  if (!lasso.value) return
-  if (lasso.value.pointsPx.length >= 3) {
-    applyLasso(lasso.value.mode, lasso.value.pointsPx)
-  }
-  lasso.value = null
-  hoverPoint.value = null
-}
-
-function cancelLasso() {
-  lasso.value = null
-  hoverPoint.value = null
-}
-
-function onKeyUp(event: KeyboardEvent) {
-  // If a button is still down, the coming pointerup finalizes instead.
-  if (event.key === 'Shift' && lasso.value && !lassoButtonDown) finishLasso()
 }
 
 function onKeyDown(event: KeyboardEvent) {
-  if (event.key === 'Escape') {
-    cancelLasso()
-    return
-  }
   if (!(event.ctrlKey || event.metaKey) || phase.value !== 'regions') return
   const key = event.key.toLowerCase()
   if (key === 'z' && !event.shiftKey) {
@@ -559,11 +546,11 @@ async function runExtraction() {
 }
 
 function computeIoU() {
-  if (!truthCtx || !rectifiedW.value) {
+  if (!rectifiedW.value || !truthPolysPx.value.length) {
     iou.value = null
     return
   }
-  const scale = 0.5 // score at 2 px/mm — plenty
+  const scale = 0.5
   const w = Math.round(rectifiedW.value * scale)
   const h = Math.round(rectifiedH.value * scale)
 
@@ -571,7 +558,10 @@ function computeIoU() {
   truthSmall.width = w
   truthSmall.height = h
   const tc = truthSmall.getContext('2d', { willReadFrequently: true })!
-  tc.drawImage(truthCanvas, 0, 0, w, h)
+  tc.scale(scale, scale)
+  for (const poly of truthPolysPx.value) {
+    fillRings(tc, [poly.outer, ...poly.holes])
+  }
 
   const det = document.createElement('canvas')
   det.width = w
@@ -739,57 +729,100 @@ watch([corners, paperChoice], () => scheduleSave(), { deep: true })
           @pointerdown="onRegionsDown"
           @pointermove="onRegionsMove"
           @pointerup="onRegionsUp"
+          @dblclick.prevent="onRegionsDblClick"
           @contextmenu.prevent
         >
           <image :href="rectifiedUrl" :width="rectifiedW" :height="rectifiedH" />
-          <template v-if="showDetection">
-            <polygon
-              v-for="(contour, i) in detected"
-              :key="`d${i}`"
-              :points="polygonToSvgPoints(contour.pointsPx)"
-              fill="none"
-              stroke="#ff9f43"
-              :stroke-width="strokePx * 1.5"
-              stroke-dasharray="6 4"
-            />
-          </template>
+          <!-- Truth fill (no stroke) under the blend group -->
           <path
-            v-for="(poly, i) in truthPolysPx"
-            :key="`t${i}`"
+            v-for="(poly, pi) in truthPolysPx"
+            :key="`tf${pi}`"
             :d="truthPathD(poly)"
             fill="rgba(76,141,255,0.18)"
             fill-rule="evenodd"
-            stroke="#4c8dff"
-            :stroke-width="strokePx"
+            stroke="none"
+            style="pointer-events: none"
           />
-          <polyline
-            v-if="lasso"
-            :points="polygonToSvgPoints(lasso.pointsPx)"
-            fill="none"
-            :stroke="lasso.mode === 'add' ? '#3fb970' : '#ff5050'"
-            :stroke-width="strokePx * 2"
-          />
-          <line
-            v-if="lasso && hoverPoint"
-            :x1="lasso.pointsPx[lasso.pointsPx.length - 1][0]"
-            :y1="lasso.pointsPx[lasso.pointsPx.length - 1][1]"
-            :x2="hoverPoint[0]"
-            :y2="hoverPoint[1]"
-            :stroke="lasso.mode === 'add' ? '#3fb970' : '#ff5050'"
-            :stroke-width="strokePx"
-            stroke-dasharray="5 5"
-          />
+          <!-- Strokes isolated so orange∩blue → purple, without blending into the photo -->
+          <g class="contour-strokes">
+            <path
+              v-for="(poly, pi) in truthPolysPx"
+              :key="`ts${pi}`"
+              :d="truthPathD(poly)"
+              fill="none"
+              fill-rule="evenodd"
+              stroke="#4c8dff"
+              :stroke-width="strokePx"
+              style="pointer-events: none"
+            />
+            <template v-if="showDetection">
+              <polygon
+                v-for="(contour, i) in detected"
+                :key="`d${i}`"
+                class="detection-stroke"
+                :points="polygonToSvgPoints(contour.pointsPx)"
+                fill="none"
+                stroke="#ff9f43"
+                :stroke-width="strokePx"
+              />
+            </template>
+          </g>
+          <g v-for="(poly, pi) in truthPolysPx" :key="`t${pi}`">
+            <template v-for="(c, vi) in poly.outer" :key="`o${vi}`">
+              <g class="vertex">
+                <circle
+                  class="vertex-hit"
+                  :cx="c[0]"
+                  :cy="c[1]"
+                  :r="vertexHitR"
+                  @pointerdown="onVertDown({ poly: pi, hole: -1, idx: vi }, $event)"
+                />
+                <circle
+                  class="vertex-dot"
+                  :cx="c[0]"
+                  :cy="c[1]"
+                  :r="vertexR"
+                  fill="rgba(76,141,255,0.55)"
+                  stroke="#fff"
+                  :stroke-width="strokePx * 0.4"
+                />
+              </g>
+            </template>
+            <template v-for="(hole, hi) in poly.holes" :key="`h${hi}`">
+              <template v-for="(c, vi) in hole" :key="`hv${vi}`">
+                <g class="vertex">
+                  <circle
+                    class="vertex-hit"
+                    :cx="c[0]"
+                    :cy="c[1]"
+                    :r="vertexHitR"
+                    @pointerdown="onVertDown({ poly: pi, hole: hi, idx: vi }, $event)"
+                  />
+                  <circle
+                    class="vertex-dot"
+                    :cx="c[0]"
+                    :cy="c[1]"
+                    :r="vertexR"
+                    fill="rgba(255,120,80,0.55)"
+                    stroke="#fff"
+                    :stroke-width="strokePx * 0.4"
+                  />
+                </g>
+              </template>
+            </template>
+          </g>
         </svg>
       </div>
       <aside class="sidebar">
         <div class="panel">
           <h3>Correct the outline</h3>
-          <p class="muted">The blue outline is the ground truth (seeded from detection).</p>
+          <p class="muted">
+            Blue = truth, orange = detection, purple = where they overlap.
+          </p>
           <ul class="muted help-list">
-            <li><b>Left-drag</b> — add the encircled area</li>
-            <li><b>Right-drag</b> — carve it away</li>
-            <li><b>Shift</b> — keep selection open; clicks add straight segments, drags add freehand; release Shift to apply</li>
-            <li><b>Esc</b> — cancel the selection</li>
+            <li><b>Left-drag</b> a vertex — move it</li>
+            <li><b>Double-click</b> an edge — insert a vertex</li>
+            <li><b>Right-click</b> a vertex — delete it (rings keep ≥3 points)</li>
             <li><b>Ctrl+Z</b> / <b>Ctrl+Y</b> — undo / redo</li>
             <li><b>Wheel</b> — zoom</li>
             <li><b>Middle-drag</b> — pan</li>
@@ -797,7 +830,6 @@ watch([corners, paperChoice], () => scheduleSave(), { deep: true })
           <div class="actions left">
             <button :disabled="!undoDepth" @click="undoEdit">Undo</button>
             <button :disabled="!redoDepth" @click="redoEdit">Redo</button>
-            <button @click="resetToDetection">Reset to detection</button>
           </div>
         </div>
         <div class="panel">
@@ -805,7 +837,7 @@ watch([corners, paperChoice], () => scheduleSave(), { deep: true })
           <div class="field">
             <label>
               <input v-model="showDetection" type="checkbox" />
-              Show detected contours (orange dashed)
+              Show detected contours (orange; purple where they match truth)
             </label>
           </div>
           <div class="field">
@@ -816,6 +848,11 @@ watch([corners, paperChoice], () => scheduleSave(), { deep: true })
             Detection IoU vs truth:
             <b>{{ iou === null ? '—' : (iou * 100).toFixed(1) + '%' }}</b>
           </p>
+          <div class="actions left">
+            <button :disabled="!detected.length" @click="resetToDetection">
+              Override truth with detection
+            </button>
+          </div>
         </div>
         <div class="panel">
           <div class="actions">
@@ -903,6 +940,35 @@ header select {
 .fit.draw {
   touch-action: none;
   cursor: crosshair;
+}
+
+.contour-strokes {
+  isolation: isolate;
+  pointer-events: none;
+}
+
+.detection-stroke {
+  /* Orange vs blue → magenta/purple where strokes overlap; orange alone elsewhere. */
+  mix-blend-mode: difference;
+}
+
+.vertex {
+  cursor: crosshair;
+}
+
+.vertex-hit {
+  fill: transparent;
+  touch-action: none;
+}
+
+.vertex-dot {
+  pointer-events: none;
+  transition: fill 80ms ease, stroke 80ms ease;
+}
+
+.vertex:hover .vertex-dot {
+  fill: #ffe566;
+  stroke: #1a1a1a;
 }
 
 .sidebar {
