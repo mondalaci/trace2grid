@@ -1,0 +1,26 @@
+{
+  "name": "trace2grid",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc -b && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@techstark/opencv-js": "^5.0.0-release.1",
+    "jspdf": "^4.2.1",
+    "manifold-3d": "^3.5.1",
+    "pinia": "^4.0.2",
+    "three": "^0.185.1",
+    "vue": "^3.5.40"
+  },
+  "devDependencies": {
+    "@types/three": "^0.185.1",
+    "@vitejs/plugin-vue": "^6.0.8",
+    "typescript": "~5.9.3",
+    "vite": "^8.1.5",
+    "vue-tsc": "^3.3.8"
+  }
+}
