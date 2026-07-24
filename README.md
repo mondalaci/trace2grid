@@ -16,6 +16,7 @@ Turn a photo of your tools into a 3D-printable [Gridfinity](https://gridfinity.x
 | --- | --- |
 | UI | Vue 3 + TypeScript + Vite + Pinia |
 | Paper detection, rectification, contours | OpenCV.js (WASM, lazy-loaded) |
+| Neural tool segmentation (optional) | TinyUNet ONNX via onnxruntime-web (WebGPU/WASM) |
 | Solid modeling (bin, pockets, offsetting) | manifold-3d (WASM CSG, in a Web Worker) |
 | 3D preview | three.js |
 | PDF export | jsPDF |
@@ -53,6 +54,19 @@ To re-score the detector against all labeled photos (with the dev server running
 ```
 
 Each run appends rows to `training/accuracy-log.csv` (`timestamp`, `file`, `accuracy`, `note`). The `mean` row is the average IoU across labeled photos; per-photo rows follow.
+
+### Neural segmentation (GPU train → browser ONNX)
+
+Classical OpenCV tops out around ~83% mean IoU on harsh contact shadows. To go further, train a small U-Net on the labeled photos (your GPU) and export ONNX for client-side inference:
+
+```bash
+cd ml && python3 -m venv .venv && source .venv/bin/activate
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+pip install -r requirements.txt
+npm run ml:quick          # or: npm run ml  for the longer default
+```
+
+See [`ml/README.md`](ml/README.md) for details. With only a handful of labels, trust **leave-one-out** IoU, not the full-fit train score.
 
 ## Tips for good scans
 

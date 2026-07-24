@@ -1,0 +1,8 @@
+{
+  "longSide": 768,
+  "base": 32,
+  "input": "image",
+  "output": "logits",
+  "normalize": "rgb_to_[-1,1]",
+  "checkpoint": "/home/laci/projects/trace2grid/ml/runs/full/best.pt"
+}
