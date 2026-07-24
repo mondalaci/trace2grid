@@ -119,7 +119,7 @@ function onCornersUp() {
 async function confirmCorners() {
   if (!photoCanvas.value || !corners.value) return
   error.value = null
-  busy.value = 'Rectifying and finding tools…'
+  busy.value = 'Straightening the photo and detecting tools…'
   try {
     const cv = await loadOpenCV()
     await new Promise((r) => setTimeout(r))
@@ -311,7 +311,9 @@ function restart() {
       </aside>
     </div>
 
-    <div v-if="busy" class="status">{{ busy }}</div>
+    <div v-if="busy" class="busy-overlay">
+      <span>{{ busy }}</span>
+    </div>
     <div v-if="error" class="status error">{{ error }}</div>
   </div>
 </template>
@@ -431,6 +433,25 @@ function restart() {
   display: flex;
   gap: 8px;
   justify-content: flex-end;
+}
+
+.busy-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  background: rgba(5, 8, 12, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.busy-overlay span {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 12px 26px;
+  font-weight: 600;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5);
 }
 
 .status {

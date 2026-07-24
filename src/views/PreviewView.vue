@@ -47,6 +47,12 @@ function initScene() {
   controls = new OrbitControls(camera, renderer.domElement)
   controls.enableDamping = true
   controls.dampingFactor = 0.1
+  // Middle-drag pans (wheel already zooms); right-drag keeps panning too.
+  controls.mouseButtons = {
+    LEFT: THREE.MOUSE.ROTATE,
+    MIDDLE: THREE.MOUSE.PAN,
+    RIGHT: THREE.MOUSE.PAN,
+  }
 
   scene.add(new THREE.HemisphereLight(0xdde4ee, 0x30363f, 1.1))
   const sun = new THREE.DirectionalLight(0xffffff, 1.6)

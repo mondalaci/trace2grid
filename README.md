@@ -33,6 +33,18 @@ npm run preview  # serve the production build locally
 
 Deploy by uploading `dist/` to any static host — the bundle uses relative paths, so it works from a subdirectory too.
 
+## Training data
+
+Detection quality is tuned against labeled ground truth in `training/`: each photo sits next to a `<photo>.json` annotation with the exact paper corners and the corrected tool outlines (in paper millimeters).
+
+To label photos, drop them into `training/`, run `npm run dev`, and open `http://localhost:5173/train.html`:
+
+1. Pick the photo, drag the paper corners exactly onto the sheet edges (wheel zooms, middle-drag pans).
+2. "Label tools →" seeds the blue outline from the current detector; left-drag adds area, right-drag carves away (shadows, gaps).
+3. Everything autosaves to `training/<photo>.json`.
+
+Contributions of tricky photos (shiny tools, harsh shadows, unusual paper/backgrounds) with corrected labels are welcome — submit both files in a PR. Please strip EXIF GPS data first, e.g. `exiftool -gps:all= training/*.jpg`.
+
 ## Tips for good scans
 
 - Strong, even light; avoid hard shadows next to tools (or lower the sensitivity slider).
