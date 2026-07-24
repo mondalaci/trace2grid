@@ -79,6 +79,8 @@ const strokePx = computed(() => viewBox.w / 300)
 const vertexR = computed(() => viewBox.w / 280)
 /** Invisible hit target — larger than the drawn handle for easier grabbing. */
 const vertexHitR = computed(() => Math.max(vertexR.value * 4, viewBox.w / 70))
+const cornerR = computed(() => cornersViewBox.w / 280)
+const cornerHitR = computed(() => Math.max(cornerR.value * 4, cornersViewBox.w / 70))
 const cornersViewBoxAttr = computed(
   () => `${cornersViewBox.x} ${cornersViewBox.y} ${cornersViewBox.w} ${cornersViewBox.h}`,
 )
@@ -245,8 +247,11 @@ async function selectPhoto(name: string) {
 
 // --- corner dragging, with the same zoom/pan as the labeling phase ---
 function onCornerDown(index: number, event: PointerEvent) {
+  if (event.button !== 0 || !cornersSvg.value) return
+  event.preventDefault()
+  event.stopPropagation()
+  cornersSvg.value.setPointerCapture(event.pointerId)
   draggingCorner = index
-  ;(event.target as Element).setPointerCapture(event.pointerId)
 }
 
 function onCornersWheel(event: WheelEvent) {
@@ -680,18 +685,24 @@ watch([corners, paperChoice], () => scheduleSave(), { deep: true })
             stroke="#4c8dff"
             :stroke-width="cornersViewBox.w / 400"
           />
-          <circle
-            v-for="(c, i) in corners"
-            :key="i"
-            :cx="c[0]"
-            :cy="c[1]"
-            :r="cornersViewBox.w / 45"
-            fill="rgba(76,141,255,0.35)"
-            stroke="#fff"
-            :stroke-width="cornersViewBox.w / 500"
-            style="cursor: grab; touch-action: none"
-            @pointerdown="onCornerDown(i, $event)"
-          />
+          <g v-for="(c, i) in corners" :key="i" class="vertex">
+            <circle
+              class="vertex-hit"
+              :cx="c[0]"
+              :cy="c[1]"
+              :r="cornerHitR"
+              @pointerdown="onCornerDown(i, $event)"
+            />
+            <circle
+              class="vertex-dot"
+              :cx="c[0]"
+              :cy="c[1]"
+              :r="cornerR"
+              fill="rgba(76,141,255,0.55)"
+              stroke="#fff"
+              :stroke-width="cornersViewBox.w / 500"
+            />
+          </g>
         </svg>
       </div>
       <aside class="sidebar">
