@@ -45,6 +45,15 @@ To label photos, drop them into `training/`, run `npm run dev`, and open `http:/
 
 Contributions of tricky photos (shiny tools, harsh shadows, unusual paper/backgrounds) with corrected labels are welcome — submit both files in a PR. Please strip EXIF GPS data first, e.g. `exiftool -gps:all= training/*.jpg`.
 
+To re-score the detector against all labeled photos (with the dev server running):
+
+```bash
+# open http://localhost:5173/eval.html
+# add ?tune=1 to run a parameter grid search
+```
+
+Each run appends rows to `training/accuracy-log.csv` (`timestamp`, `file`, `accuracy`, `note`). The `mean` row is the average IoU across labeled photos; per-photo rows follow.
+
 ## Tips for good scans
 
 - Strong, even light; avoid hard shadows next to tools (or lower the sensitivity slider).

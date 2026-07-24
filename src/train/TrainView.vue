@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { extractToolContours, type ExtractedContour } from '../lib/scan/contours'
 import { loadOpenCV } from '../lib/scan/opencv'
 import {
@@ -110,6 +110,7 @@ function truthPathD(poly: { outer: Vec2[]; holes: Vec2[][] }): string {
 onMounted(async () => {
   window.addEventListener('keyup', onKeyUp)
   window.addEventListener('keydown', onKeyDown)
+  window.addEventListener('beforeunload', onBeforeUnload)
   const res = await fetch('/__training/photos')
   photos.value = (await res.json()).photos
   const requested = new URLSearchParams(location.search).get('photo')
@@ -117,8 +118,41 @@ onMounted(async () => {
   if (first) await selectPhoto(first)
 })
 
+onUnmounted(() => {
+  window.removeEventListener('keyup', onKeyUp)
+  window.removeEventListener('keydown', onKeyDown)
+  window.removeEventListener('beforeunload', onBeforeUnload)
+})
+
+function isDirty() {
+  return saveState.value === 'dirty' || saveState.value === 'saving'
+}
+
+function onBeforeUnload(event: BeforeUnloadEvent) {
+  if (!isDirty()) return
+  event.preventDefault()
+  // Required for Chromium to show the native leave dialog.
+  event.returnValue = ''
+}
+
+async function onPhotoSelect(event: Event) {
+  const sel = event.target as HTMLSelectElement
+  const name = sel.value
+  if (name === selectedPhoto.value) return
+  if (isDirty()) {
+    const ok = confirm(
+      'You have unsaved changes. Save them and switch photos?\n\nCancel to stay on this photo.',
+    )
+    if (!ok) {
+      sel.value = selectedPhoto.value
+      return
+    }
+  }
+  await selectPhoto(name)
+}
+
 async function selectPhoto(name: string) {
-  await flushSave()
+  if (isDirty()) await flushSave()
   selectedPhoto.value = name
   error.value = null
   busy.value = 'Loading photo…'
@@ -567,6 +601,17 @@ watch(sensitivity, () => {
 // --- autosave ---
 function buildAnnotation(): TrainingAnnotation | null {
   if (!corners.value || !photoW.value) return null
+  // While still on the corners phase, truthPolysPx is empty — keep any
+  // previously labeled outlines instead of wiping them on corner tweaks.
+  const truth =
+    truthPolysPx.value.length > 0
+      ? truthPolysPx.value.map((poly) => ({
+          outerMm: poly.outer.map(([x, y]) => [x / PX_PER_MM, y / PX_PER_MM] as Vec2),
+          holesMm: poly.holes.map((h) => h.map(([x, y]) => [x / PX_PER_MM, y / PX_PER_MM] as Vec2)),
+        }))
+      : seededFor
+        ? []
+        : (savedTruth ?? [])
   return {
     photo: selectedPhoto.value,
     paperSizeId: effectivePaperId.value,
@@ -574,10 +619,7 @@ function buildAnnotation(): TrainingAnnotation | null {
     corners: corners.value.map(([x, y]) => [x / photoW.value, y / photoH.value]) as [
       Vec2, Vec2, Vec2, Vec2,
     ],
-    truth: truthPolysPx.value.map((poly) => ({
-      outerMm: poly.outer.map(([x, y]) => [x / PX_PER_MM, y / PX_PER_MM] as Vec2),
-      holesMm: poly.holes.map((h) => h.map(([x, y]) => [x / PX_PER_MM, y / PX_PER_MM] as Vec2)),
-    })),
+    truth,
   }
 }
 
@@ -620,7 +662,7 @@ watch([corners, paperChoice], () => scheduleSave(), { deep: true })
   <div class="train">
     <header>
       <h1>Detection training</h1>
-      <select :value="selectedPhoto" @change="selectPhoto(($event.target as HTMLSelectElement).value)">
+      <select :value="selectedPhoto" @change="onPhotoSelect">
         <option v-for="p in photos" :key="p" :value="p">{{ p }}</option>
       </select>
       <span class="save-state" :class="saveState">{{

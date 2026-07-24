@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="robots" content="noindex" />
+    <title>Trace2Grid — detection eval</title>
+    <style>
+      body {
+        font-family: ui-sans-serif, system-ui, sans-serif;
+        background: #0d1117;
+        color: #e6edf3;
+        margin: 24px;
+      }
+      pre {
+        background: #161b22;
+        padding: 16px;
+        border-radius: 8px;
+        overflow: auto;
+      }
+      .muted {
+        color: #8b949e;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Detection eval</h1>
+    <p class="muted">Scoring labeled photos in <code>training/</code> against the current detector…</p>
+    <pre id="out">loading…</pre>
+    <script type="module">
+      import { logAccuracy, scoreAllLabeled } from '/src/train/evalRunner.ts'
+      import { DEFAULT_CONTOUR_PARAMS } from '/src/lib/scan/params.ts'
+
+      const out = document.getElementById('out')
+      const note = new URLSearchParams(location.search).get('note') ?? 'eval'
+      const tune = new URLSearchParams(location.search).get('tune') === '1'
+
+      function fmt(result) {
+        const lines = [
+          `timestamp: ${result.timestamp}`,
+          `mean IoU: ${(result.meanIoU * 100).toFixed(2)}%`,
+          '',
+          ...result.scores.map(
+            (s) =>
+              `${s.photo}: ${(s.iou * 100).toFixed(2)}%  (detected ${s.detectedCount}, truth ${s.truthCount})`,
+          ),
+        ]
+        return lines.join('\n')
+      }
+
+      try {
+        if (tune) {
+          const darkRatios = [0.42, 0.46, 0.5, 0.54, 0.58]
+          const chromas = [22, 25, 27, 30, 33]
+          const closes = [5, 7, 9]
+          const highlights = [20, 25, 30]
+          let best = null
+          let tried = 0
+          for (const darkRatio0 of darkRatios) {
+            for (const chroma0 of chromas) {
+              for (const closeKernel of closes) {
+                for (const highlightDelta of highlights) {
+                  const params = { darkRatio0, chroma0, closeKernel, highlightDelta }
+                  const result = await scoreAllLabeled(params)
+                  tried++
+                  out.textContent = `tuning ${tried}… best so far ${(best?.meanIoU ?? 0) * 100}%\n` + fmt(result)
+                  if (!best || result.meanIoU > best.meanIoU) {
+                    best = { ...result, params }
+                  }
+                }
+              }
+            }
+          }
+          best.note = 'tuned grid search'
+          await logAccuracy(best, 'tuned')
+          out.textContent =
+            `TUNED (${tried} combos)\n` +
+            `best params: ${JSON.stringify(best.params)}\n\n` +
+            fmt(best) +
+            `\n\ndefaults were: ${JSON.stringify(DEFAULT_CONTOUR_PARAMS)}`
+          window.__EVAL_RESULT__ = best
+        } else {
+          const result = await scoreAllLabeled()
+          await logAccuracy(result, note)
+          out.textContent = fmt(result)
+          window.__EVAL_RESULT__ = result
+        }
+      } catch (e) {
+        out.textContent = String(e?.stack || e)
+        window.__EVAL_ERROR__ = String(e)
+      }
+    </script>
+  </body>
+</html>

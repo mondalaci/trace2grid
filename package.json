@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc -b && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "eval": "echo 'Open http://localhost:5173/eval.html (add ?tune=1 to grid-search)'"
   },
   "dependencies": {
     "@techstark/opencv-js": "^5.0.0-release.1",

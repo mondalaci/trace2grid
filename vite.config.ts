@@ -1,6 +1,6 @@
 import vue from '@vitejs/plugin-vue'
 import { existsSync } from 'node:fs'
-import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { defineConfig, type Plugin } from 'vite'
 
@@ -20,6 +20,8 @@ const PHOTO_MIME: Record<string, string> = {
  *   GET  /__training/photo/<name> -> image bytes
  *   GET  /__training/data/<name>  -> saved annotation JSON (404 if none)
  *   POST /__training/data/<name>  -> persist annotation JSON
+ *   GET  /__training/accuracy     -> accuracy-log.csv
+ *   POST /__training/accuracy     -> append one eval row to accuracy-log.csv
  */
 function trainingPlugin(): Plugin {
   let root = ''
@@ -37,6 +39,7 @@ function trainingPlugin(): Plugin {
           const name = rawName ? path.basename(decodeURIComponent(rawName)) : ''
           const photosDir = path.join(root, 'training')
           const dataDir = path.join(root, 'training')
+          const accuracyLog = path.join(root, 'training', 'accuracy-log.csv')
 
           if (action === 'photos') {
             const entries = existsSync(photosDir) ? await readdir(photosDir) : []
@@ -79,6 +82,41 @@ function trainingPlugin(): Plugin {
             return
           }
 
+          if (action === 'accuracy') {
+            if (req.method === 'POST') {
+              const chunks: Buffer[] = []
+              for await (const chunk of req) chunks.push(chunk as Buffer)
+              const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
+                timestamp: string
+                meanIoU: number
+                note?: string
+                scores: { photo: string; iou: number }[]
+              }
+              await mkdir(dataDir, { recursive: true })
+              const header = 'timestamp,file,accuracy,note\n'
+              if (!existsSync(accuracyLog)) await writeFile(accuracyLog, header)
+              const note = csvEscape(body.note ?? '')
+              const lines = [
+                `${body.timestamp},mean,${body.meanIoU.toFixed(6)},${note}`,
+                ...body.scores.map(
+                  (s) => `${body.timestamp},${csvEscape(s.photo)},${s.iou.toFixed(6)},${note}`,
+                ),
+              ]
+              await appendFile(accuracyLog, lines.join('\n') + '\n')
+              res.setHeader('Content-Type', 'application/json')
+              res.end('{"ok":true}')
+              return
+            }
+            if (!existsSync(accuracyLog)) {
+              res.statusCode = 404
+              res.end('not found')
+              return
+            }
+            res.setHeader('Content-Type', 'text/csv')
+            res.end(await readFile(accuracyLog))
+            return
+          }
+
           res.statusCode = 400
           res.end('bad request')
         })().catch((err) => {
@@ -88,6 +126,11 @@ function trainingPlugin(): Plugin {
       })
     },
   }
+}
+
+function csvEscape(value: string): string {
+  if (/[",\n]/.test(value)) return `"${value.replace(/"/g, '""')}"`
+  return value
 }
 
 export default defineConfig({
@@ -107,6 +150,7 @@ export default defineConfig({
       input: {
         main: path.resolve(import.meta.dirname, 'index.html'),
         train: path.resolve(import.meta.dirname, 'train.html'),
+        eval: path.resolve(import.meta.dirname, 'eval.html'),
       },
     },
   },
