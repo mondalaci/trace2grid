@@ -18,6 +18,8 @@ def letterbox(
     image: np.ndarray,
     mask: np.ndarray,
     long_side: int,
+    *,
+    image_fill: tuple[int, int, int] = (255, 255, 255),
 ) -> tuple[np.ndarray, np.ndarray]:
     h, w = image.shape[:2]
     scale = long_side / max(h, w)
@@ -28,12 +30,14 @@ def letterbox(
     pad_x = long_side - nw
     top, left = pad_y // 2, pad_x // 2
     bottom, right = pad_y - top, pad_x - left
-    image = cv2.copyMakeBorder(image, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(255, 255, 255))
+    image = cv2.copyMakeBorder(
+        image, top, bottom, left, right, cv2.BORDER_CONSTANT, value=image_fill
+    )
     mask = cv2.copyMakeBorder(mask, top, bottom, left, right, cv2.BORDER_CONSTANT, value=0)
     return image, mask
 
 
-def train_augment() -> A.Compose:
+def train_augment(*, image_fill: int = 255) -> A.Compose:
     return A.Compose(
         [
             A.HorizontalFlip(p=0.5),
@@ -45,7 +49,7 @@ def train_augment() -> A.Compose:
                 rotate=(-15, 15),
                 shear=(-5, 5),
                 border_mode=cv2.BORDER_CONSTANT,
-                fill=255,
+                fill=image_fill,
                 fill_mask=0,
                 p=0.7,
             ),
@@ -92,10 +96,13 @@ class ToolSegDataset(Dataset):
         augment: bool,
         long_side: int = TRAIN_LONG_SIDE,
         repeats: int = 1,
+        image_fill: tuple[int, int, int] = (255, 255, 255),
     ) -> None:
         self.root = root
         self.ids = ids
-        self.augment = train_augment() if augment else None
+        self.image_fill = image_fill
+        fill_scalar = int(image_fill[0])
+        self.augment = train_augment(image_fill=fill_scalar) if augment else None
         self.long_side = long_side
         self.repeats = max(1, repeats)
 
@@ -110,7 +117,7 @@ class ToolSegDataset(Dataset):
         if image is None or mask is None:
             raise FileNotFoundError(folder)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        image, mask = letterbox(image, mask, self.long_side)
+        image, mask = letterbox(image, mask, self.long_side, image_fill=self.image_fill)
         if self.augment is not None:
             out = self.augment(image=image, mask=mask)
             image, mask = out["image"], out["mask"]

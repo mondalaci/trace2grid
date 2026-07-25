@@ -22,13 +22,79 @@ export interface ExtractOptions {
 }
 
 /**
- * Find tool silhouettes on the rectified (white) paper.
- *
- * Lab chroma / darkness / highlight vs local paper background, then
- * morphological open/close. Tuned on training/ (see accuracy-log.csv).
- *
- * Contact shadows that match tool darkness are the main residual error;
- * classical peel/reconstruction cannot separate them without cutting metal.
+ * Turn a binary mask (0 / 255) into simplified tool outlines.
+ * Shared by classical Lab thresholding and neural segmentation.
+ */
+export function contoursFromBinaryMask(
+  cv: CV,
+  mask: Uint8Array,
+  width: number,
+  height: number,
+  options: ExtractOptions,
+): ExtractedContour[] {
+  const params: ContourParams = { ...DEFAULT_CONTOUR_PARAMS, ...options.params }
+  const { pxPerMm } = options
+  const marginPx = Math.round((options.marginMm ?? params.marginMm) * pxPerMm)
+  const minAreaPx = (options.minAreaMm2 ?? params.minAreaMm2) * pxPerMm * pxPerMm
+  const openK = Math.max(1, params.openKernel | 1)
+  const closeK = Math.max(1, params.closeKernel | 1)
+  const kernelOpen = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(openK, openK))
+  const kernelClose = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(closeK, closeK))
+  const contours = new cv.MatVector()
+  const hierarchy = new cv.Mat()
+  const maskMat = cv.matFromArray(height, width, cv.CV_8UC1, mask as unknown as number[])
+  try {
+    const black = new cv.Scalar(0)
+    cv.rectangle(maskMat, new cv.Point(0, 0), new cv.Point(width, marginPx), black, -1)
+    cv.rectangle(maskMat, new cv.Point(0, height - marginPx), new cv.Point(width, height), black, -1)
+    cv.rectangle(maskMat, new cv.Point(0, 0), new cv.Point(marginPx, height), black, -1)
+    cv.rectangle(maskMat, new cv.Point(width - marginPx, 0), new cv.Point(width, height), black, -1)
+
+    cv.morphologyEx(maskMat, maskMat, cv.MORPH_OPEN, kernelOpen)
+    cv.morphologyEx(maskMat, maskMat, cv.MORPH_CLOSE, kernelClose)
+    cv.findContours(maskMat, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+
+    const results: ExtractedContour[] = []
+    for (let i = 0; i < contours.size(); i++) {
+      const contour = contours.get(i)
+      const areaPx = cv.contourArea(contour)
+      if (areaPx < minAreaPx) continue
+
+      const rect = cv.boundingRect(contour)
+      const touchesEdge =
+        rect.x <= marginPx + 1 ||
+        rect.y <= marginPx + 1 ||
+        rect.x + rect.width >= width - marginPx - 1 ||
+        rect.y + rect.height >= height - marginPx - 1
+      if (touchesEdge) continue
+
+      const approx = new cv.Mat()
+      try {
+        cv.approxPolyDP(contour, approx, params.approxEpsMm * pxPerMm, true)
+        if (approx.rows < 3) continue
+        const pointsPx: Vec2[] = []
+        for (let p = 0; p < approx.rows; p++) {
+          pointsPx.push([approx.data32S[p * 2], approx.data32S[p * 2 + 1]])
+        }
+        results.push({ pointsPx, areaMm2: areaPx / (pxPerMm * pxPerMm) })
+      } finally {
+        approx.delete()
+      }
+    }
+    results.sort((a, b) => b.areaMm2 - a.areaMm2)
+    return results
+  } finally {
+    maskMat.delete()
+    kernelOpen.delete()
+    kernelClose.delete()
+    contours.delete()
+    hierarchy.delete()
+  }
+}
+
+/**
+ * Classical tool silhouettes on rectified paper (Lab chroma / darkness / highlight).
+ * Kept for eval/tuning; production capture uses neural segmentation (`extractToolContoursNn`).
  */
 export function extractToolContours(
   cv: CV,
@@ -37,8 +103,6 @@ export function extractToolContours(
 ): ExtractedContour[] {
   const params: ContourParams = { ...DEFAULT_CONTOUR_PARAMS, ...options.params }
   const { pxPerMm } = options
-  const marginPx = Math.round((options.marginMm ?? params.marginMm) * pxPerMm)
-  const minAreaPx = (options.minAreaMm2 ?? params.minAreaMm2) * pxPerMm * pxPerMm
   const sensitivity = options.sensitivity ?? 0
 
   const darkRatio = darkRatioAt(params, sensitivity)
@@ -48,13 +112,6 @@ export function extractToolContours(
   const src = cv.imread(rectified)
   const rgb = new cv.Mat()
   const lab = new cv.Mat()
-  const openK = Math.max(1, params.openKernel | 1)
-  const closeK = Math.max(1, params.closeKernel | 1)
-  const kernelOpen = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(openK, openK))
-  const kernelClose = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(closeK, closeK))
-  const contours = new cv.MatVector()
-  const hierarchy = new cv.Mat()
-  let maskMat: InstanceType<CV['Mat']> | null = null
   let bgSmall: InstanceType<CV['Mat']> | null = null
   let bgMat: InstanceType<CV['Mat']> | null = null
   let lMat: InstanceType<CV['Mat']> | null = null
@@ -103,47 +160,7 @@ export function extractToolContours(
       }
     }
 
-    maskMat = cv.matFromArray(h, w, cv.CV_8UC1, mask as unknown as number[])
-    const black = new cv.Scalar(0)
-    cv.rectangle(maskMat, new cv.Point(0, 0), new cv.Point(w, marginPx), black, -1)
-    cv.rectangle(maskMat, new cv.Point(0, h - marginPx), new cv.Point(w, h), black, -1)
-    cv.rectangle(maskMat, new cv.Point(0, 0), new cv.Point(marginPx, h), black, -1)
-    cv.rectangle(maskMat, new cv.Point(w - marginPx, 0), new cv.Point(w, h), black, -1)
-
-    cv.morphologyEx(maskMat, maskMat, cv.MORPH_OPEN, kernelOpen)
-    cv.morphologyEx(maskMat, maskMat, cv.MORPH_CLOSE, kernelClose)
-
-    cv.findContours(maskMat, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-
-    const results: ExtractedContour[] = []
-    for (let i = 0; i < contours.size(); i++) {
-      const contour = contours.get(i)
-      const areaPx = cv.contourArea(contour)
-      if (areaPx < minAreaPx) continue
-
-      const rect = cv.boundingRect(contour)
-      const touchesEdge =
-        rect.x <= marginPx + 1 ||
-        rect.y <= marginPx + 1 ||
-        rect.x + rect.width >= w - marginPx - 1 ||
-        rect.y + rect.height >= h - marginPx - 1
-      if (touchesEdge) continue
-
-      const approx = new cv.Mat()
-      try {
-        cv.approxPolyDP(contour, approx, params.approxEpsMm * pxPerMm, true)
-        if (approx.rows < 3) continue
-        const pointsPx: Vec2[] = []
-        for (let p = 0; p < approx.rows; p++) {
-          pointsPx.push([approx.data32S[p * 2], approx.data32S[p * 2 + 1]])
-        }
-        results.push({ pointsPx, areaMm2: areaPx / (pxPerMm * pxPerMm) })
-      } finally {
-        approx.delete()
-      }
-    }
-    results.sort((a, b) => b.areaMm2 - a.areaMm2)
-    return results
+    return contoursFromBinaryMask(cv, mask, w, h, options)
   } finally {
     src.delete()
     rgb.delete()
@@ -151,10 +168,5 @@ export function extractToolContours(
     lMat?.delete()
     bgSmall?.delete()
     bgMat?.delete()
-    maskMat?.delete()
-    kernelOpen.delete()
-    kernelClose.delete()
-    contours.delete()
-    hierarchy.delete()
   }
 }

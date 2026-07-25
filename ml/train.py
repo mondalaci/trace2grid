@@ -12,15 +12,24 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from tqdm import tqdm
 
 from config import TRAIN_LONG_SIDE
 from dataset import ToolSegDataset, load_manifest
 from model import TinyUNet, count_params
 
 ML_ROOT = Path(__file__).resolve().parent
-DEFAULT_DATA = ML_ROOT / "dataset"
-DEFAULT_RUNS = ML_ROOT / "runs"
+TASK_DEFAULTS = {
+    "tools": {
+        "data": ML_ROOT / "dataset",
+        "runs": ML_ROOT / "runs",
+        "image_fill": (255, 255, 255),
+    },
+    "paper": {
+        "data": ML_ROOT / "dataset_paper",
+        "runs": ML_ROOT / "runs" / "paper",
+        "image_fill": (0, 0, 0),
+    },
+}
 
 
 def dice_loss(logits: torch.Tensor, targets: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -87,11 +96,24 @@ def fit(
     repeats: int,
     long_side: int,
     base: int,
+    image_fill: tuple[int, int, int],
 ) -> tuple[TinyUNet, dict]:
     train_ds = ToolSegDataset(
-        data_dir, train_ids, augment=True, long_side=long_side, repeats=repeats
+        data_dir,
+        train_ids,
+        augment=True,
+        long_side=long_side,
+        repeats=repeats,
+        image_fill=image_fill,
     )
-    val_ds = ToolSegDataset(data_dir, val_ids, augment=False, long_side=long_side, repeats=1)
+    val_ds = ToolSegDataset(
+        data_dir,
+        val_ids,
+        augment=False,
+        long_side=long_side,
+        repeats=1,
+        image_fill=image_fill,
+    )
     train_loader = DataLoader(
         train_ds,
         batch_size=2,
@@ -142,6 +164,7 @@ def run_loo(args: argparse.Namespace, device: torch.device, ids: list[str]) -> d
             repeats=args.repeats,
             long_side=args.long_side,
             base=args.base,
+            image_fill=args.image_fill,
         )
         folds.append({"holdout": holdout, "val_iou": info["best_val_iou"]})
         out = args.runs / "loo" / holdout
@@ -170,6 +193,7 @@ def run_full(args: argparse.Namespace, device: torch.device, ids: list[str]) -> 
         repeats=args.repeats,
         long_side=args.long_side,
         base=args.base,
+        image_fill=args.image_fill,
     )
     out = args.runs / "full"
     out.mkdir(parents=True, exist_ok=True)
@@ -187,8 +211,9 @@ def run_full(args: argparse.Namespace, device: torch.device, ids: list[str]) -> 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--data", type=Path, default=DEFAULT_DATA)
-    ap.add_argument("--runs", type=Path, default=DEFAULT_RUNS)
+    ap.add_argument("--task", choices=("tools", "paper"), default="tools")
+    ap.add_argument("--data", type=Path, default=None)
+    ap.add_argument("--runs", type=Path, default=None)
     ap.add_argument("--mode", choices=("loo", "full", "both"), default="both")
     ap.add_argument("--epochs", type=int, default=80)
     ap.add_argument("--lr", type=float, default=1e-3)
@@ -198,8 +223,18 @@ def main() -> None:
     ap.add_argument("--cpu", action="store_true")
     args = ap.parse_args()
 
+    defaults = TASK_DEFAULTS[args.task]
+    if args.data is None:
+        args.data = defaults["data"]
+    if args.runs is None:
+        args.runs = defaults["runs"]
+    args.image_fill = defaults["image_fill"]
+
     device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
-    print(f"device={device}  params≈{count_params(TinyUNet(base=args.base)) / 1e6:.2f}M")
+    print(
+        f"task={args.task}  device={device}  "
+        f"params≈{count_params(TinyUNet(base=args.base)) / 1e6:.2f}M"
+    )
 
     manifest = load_manifest(args.data)
     ids = [m["id"] for m in manifest]
@@ -207,7 +242,7 @@ def main() -> None:
         raise SystemExit("Need ≥2 labeled samples for leave-one-out")
 
     args.runs.mkdir(parents=True, exist_ok=True)
-    result: dict = {"ids": ids, "device": str(device)}
+    result: dict = {"task": args.task, "ids": ids, "device": str(device)}
     if args.mode in ("loo", "both"):
         result["loo"] = run_loo(args, device, ids)
     if args.mode in ("full", "both"):

@@ -1,14 +1,14 @@
 /**
  * Neural tool segmentation via ONNX Runtime Web (WebGPU / WASM).
  *
- * Train/export: see ml/README.md. Place the ONNX file at
- * `public/models/toolseg.onnx` (and optional toolseg.json).
- *
- * Not wired into CaptureView yet — call `segmentToolsNn` after paper
- * rectification when you want to A/B against the OpenCV contour path.
+ * Train/export: see ml/README.md. Weights live at `public/models/toolseg.onnx`
+ * (gitignored — run `npm run ml:export` after training).
  */
 
 import type { InferenceSession, Tensor } from 'onnxruntime-web'
+import type { ExtractedContour, ExtractOptions } from './contours'
+import { contoursFromBinaryMask } from './contours'
+import type { CV } from './opencv'
 
 export interface NnSegMeta {
   longSide: number
@@ -23,31 +23,60 @@ export interface NnSegResult {
   inferenceMs: number
 }
 
-const DEFAULT_MODEL_URL = '/models/toolseg.onnx'
+const DEFAULT_MODEL_URL = `${import.meta.env.BASE_URL}models/toolseg.onnx`
 const DEFAULT_META: NnSegMeta = { longSide: 768, normalize: 'rgb_to_[-1,1]' }
 
 let sessionPromise: Promise<InferenceSession> | null = null
 let meta: NnSegMeta = DEFAULT_META
+let ortReady: Promise<typeof import('onnxruntime-web')> | null = null
 
 async function loadOrt() {
-  return import('onnxruntime-web')
+  if (!ortReady) {
+    // Default export is the WASM-inlined bundle (ort.bundle.min.mjs).
+    ortReady = import('onnxruntime-web')
+  }
+  return ortReady
+}
+
+/** Map CaptureView sensitivity (−60…60) to sigmoid threshold (more sensitive → lower thr). */
+export function thresholdFromSensitivity(sensitivity: number): number {
+  return Math.min(0.85, Math.max(0.15, 0.5 - sensitivity * (0.35 / 60)))
 }
 
 /** Lazily create an ORT session (WebGPU if available, else WASM). */
 export function loadToolSegSession(modelUrl = DEFAULT_MODEL_URL): Promise<InferenceSession> {
   if (!sessionPromise) {
     sessionPromise = (async () => {
+      const url = modelUrl
+      const probe = await fetch(url, { method: 'HEAD' }).catch(() => null)
+      if (!probe?.ok) {
+        const get = await fetch(url).catch(() => null)
+        if (!get?.ok) {
+          throw new Error(
+            `Missing tool segmentation model at ${url}. Run \`npm run ml:export\` (or \`npm run ml\`) to place toolseg.onnx in public/models/.`,
+          )
+        }
+      }
       try {
-        const res = await fetch(modelUrl.replace(/\.onnx$/, '.json'))
+        const res = await fetch(url.replace(/\.onnx$/, '.json'))
         if (res.ok) meta = { ...DEFAULT_META, ...(await res.json()) }
       } catch {
         /* keep defaults */
       }
       const ort = await loadOrt()
-      return ort.InferenceSession.create(modelUrl, {
-        executionProviders: ['webgpu', 'wasm'],
-      })
-    })()
+      try {
+        return await ort.InferenceSession.create(url, {
+          executionProviders: ['webgpu', 'wasm'],
+        })
+      } catch {
+        return ort.InferenceSession.create(url, {
+          executionProviders: ['wasm'],
+        })
+      }
+    })().catch((err) => {
+      sessionPromise = null
+      throw err
+    })
   }
   return sessionPromise
 }
@@ -116,4 +145,15 @@ export async function segmentToolsNn(
     }
   }
   return { mask, width: w, height: h, inferenceMs }
+}
+
+/** Production detector: ONNX mask → OpenCV contours (same outline format as classical). */
+export async function extractToolContoursNn(
+  cv: CV,
+  rectified: HTMLCanvasElement,
+  options: ExtractOptions,
+): Promise<ExtractedContour[]> {
+  const threshold = thresholdFromSensitivity(options.sensitivity ?? 0)
+  const { mask, width, height } = await segmentToolsNn(rectified, { threshold })
+  return contoursFromBinaryMask(cv, mask, width, height, options)
 }

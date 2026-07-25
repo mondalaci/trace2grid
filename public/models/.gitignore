@@ -1,3 +1,2 @@
-# Trained weights — regenerate with `npm run ml:export` (see ml/README.md).
-*.onnx
+# Optional external weight shards (single-file .onnx exports are committed).
 *.onnx.data

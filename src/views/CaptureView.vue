@@ -1,15 +1,17 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { polygonCentroid } from '../lib/geometry'
+import type { ExtractedContour } from '../lib/scan/contours'
+import { loadPaperSegSession } from '../lib/scan/nnPaper'
+import { extractToolContoursNn, loadToolSegSession } from '../lib/scan/nnSeg'
 import { loadOpenCV } from '../lib/scan/opencv'
 import {
   classifyPaper,
-  detectPaperQuad,
+  detectPaperQuadNn,
   PAPER_SIZES,
   paperById,
   rectifyPaper,
 } from '../lib/scan/paper'
-import { extractToolContours, type ExtractedContour } from '../lib/scan/contours'
 import { polygonToSvgPoints, svgEventPoint } from '../lib/svg'
 import { useProjectStore } from '../stores/project'
 import type { PaperSizeId, Vec2 } from '../types'
@@ -73,9 +75,16 @@ async function onFileChange(event: Event) {
 
     busy.value = 'Loading OpenCV (first time only)…'
     const cv = await loadOpenCV()
+    // Warm ONNX sessions in parallel with paper detection.
+    void loadPaperSegSession().catch(() => {
+      /* classical fallback in detectPaperQuadNn */
+    })
+    void loadToolSegSession().catch(() => {
+      /* surfaced later on extract */
+    })
     busy.value = 'Detecting paper…'
     await new Promise((r) => setTimeout(r)) // let the status paint
-    const quad = detectPaperQuad(cv, canvas)
+    const quad = await detectPaperQuadNn(cv, canvas)
     if (quad) {
       corners.value = quad
       autoDetected.value = true
@@ -131,7 +140,7 @@ async function confirmCorners() {
     rectifiedW.value = canvas.width
     rectifiedH.value = canvas.height
     sensitivity.value = 0
-    runExtraction()
+    await runExtraction()
     phase.value = 'review'
   } catch (e) {
     error.value = e instanceof Error ? e.message : String(e)
@@ -143,7 +152,7 @@ async function confirmCorners() {
 async function runExtraction() {
   if (!rectifiedCanvas.value) return
   const cv = await loadOpenCV()
-  detected.value = extractToolContours(cv, rectifiedCanvas.value, {
+  detected.value = await extractToolContoursNn(cv, rectifiedCanvas.value, {
     pxPerMm: PX_PER_MM,
     sensitivity: sensitivity.value,
   })
@@ -152,7 +161,11 @@ async function runExtraction() {
 
 watch(sensitivity, () => {
   clearTimeout(sensitivityTimer)
-  sensitivityTimer = setTimeout(runExtraction, 250)
+  sensitivityTimer = setTimeout(() => {
+    void runExtraction().catch((e) => {
+      error.value = e instanceof Error ? e.message : String(e)
+    })
+  }, 250)
 })
 
 function toggleKeep(index: number) {
@@ -291,7 +304,7 @@ function restart() {
           <div class="field">
             <label>Detection sensitivity</label>
             <input v-model.number="sensitivity" type="range" min="-60" max="60" step="5" />
-            <span class="muted">{{ sensitivity > 0 ? '+' : '' }}{{ sensitivity }} (raise if parts of tools are missed, lower if shadows are picked up)</span>
+            <span class="muted">{{ sensitivity > 0 ? '+' : '' }}{{ sensitivity }} (neural mask threshold — raise if parts of tools are missed, lower if shadows are picked up)</span>
           </div>
           <ul class="contour-list">
             <li v-for="(contour, i) in detected" :key="i" :class="{ off: !kept[i] }">

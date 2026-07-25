@@ -1,4 +1,5 @@
 import type { PaperSize, PaperSizeId, Vec2 } from '../../types'
+import { loadPaperSegSession, segmentPaperNn } from './nnPaper'
 import type { CV } from './opencv'
 
 export const PAPER_SIZES: PaperSize[] = [
@@ -27,77 +28,26 @@ export function orderCorners(pts: Vec2[]): [Vec2, Vec2, Vec2, Vec2] {
 }
 
 /**
- * Find the paper sheet as the large bright *neutral-colored* region around
- * the image center. Color similarity separates white paper from light wood
- * or other warm backgrounds far more reliably than edge detection.
- * Returns ordered corners in image pixel coordinates, or null if not found.
+ * Largest external contour → convex hull → 4-corner approx (or min-area rect).
+ * `mask` is 0/255 at `width`×`height`; returned corners are in that pixel space.
  */
-export function detectPaperQuad(cv: CV, canvas: HTMLCanvasElement): [Vec2, Vec2, Vec2, Vec2] | null {
-  const maxDim = 900
-  const scale = Math.min(1, maxDim / Math.max(canvas.width, canvas.height))
-
-  const src = cv.imread(canvas)
-  const small = new cv.Mat()
-  const lab = new cv.Mat()
+export function quadFromBinaryMask(
+  cv: CV,
+  mask: Uint8Array,
+  width: number,
+  height: number,
+): [Vec2, Vec2, Vec2, Vec2] | null {
   const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(9, 9))
   const contours = new cv.MatVector()
   const hierarchy = new cv.Mat()
-  let mask: InstanceType<CV['Mat']> | null = null
+  const maskMat = cv.matFromArray(height, width, cv.CV_8UC1, mask as unknown as number[])
   try {
-    const w = Math.round(canvas.width * scale)
-    const h = Math.round(canvas.height * scale)
-    cv.resize(src, small, new cv.Size(w, h), 0, 0, cv.INTER_AREA)
-    cv.cvtColor(small, small, cv.COLOR_RGBA2RGB)
-    cv.GaussianBlur(small, small, new cv.Size(5, 5), 0)
-    cv.cvtColor(small, lab, cv.COLOR_RGB2Lab)
-    const data = lab.data
+    cv.morphologyEx(maskMat, maskMat, cv.MORPH_CLOSE, kernel)
+    cv.morphologyEx(maskMat, maskMat, cv.MORPH_OPEN, kernel)
+    cv.findContours(maskMat, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
 
-    // Reference paper color: median Lab of the central quarter (the user is
-    // told to center the sheet, and tools cover well under half of it).
-    const sampleL: number[] = []
-    const sampleA: number[] = []
-    const sampleB: number[] = []
-    for (let y = h >> 2; y < h - (h >> 2); y += 3) {
-      for (let x = w >> 2; x < w - (w >> 2); x += 3) {
-        const i = (y * w + x) * 3
-        sampleL.push(data[i])
-        sampleA.push(data[i + 1])
-        sampleB.push(data[i + 2])
-      }
-    }
-    const med = (arr: number[]) => {
-      arr.sort((a, b) => a - b)
-      return arr[arr.length >> 1]
-    }
-    const paperL = med(sampleL)
-    const paperA = med(sampleA)
-    const paperB = med(sampleB)
-
-    // Paper-similarity mask: close in brightness and chroma to the reference.
-    // The lower brightness bound is looser: paper corners can be strongly
-    // vignetted/shadowed, while nothing relevant is brighter than the paper.
-    const lTolUp = Math.max(25, paperL * 0.15)
-    const lTolDown = Math.max(45, paperL * 0.3)
-    const abTol = 13
-    const maskData = new Uint8Array(w * h)
-    for (let i = 0; i < w * h; i++) {
-      const dl = data[i * 3] - paperL
-      if (
-        dl < lTolUp &&
-        dl > -lTolDown &&
-        Math.abs(data[i * 3 + 1] - paperA) < abTol &&
-        Math.abs(data[i * 3 + 2] - paperB) < abTol
-      ) {
-        maskData[i] = 255
-      }
-    }
-    mask = cv.matFromArray(h, w, cv.CV_8UC1, maskData as unknown as number[])
-    cv.morphologyEx(mask, mask, cv.MORPH_CLOSE, kernel)
-    cv.morphologyEx(mask, mask, cv.MORPH_OPEN, kernel)
-
-    cv.findContours(mask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
     let bestIndex = -1
-    let bestArea = w * h * 0.12
+    let bestArea = width * height * 0.12
     for (let i = 0; i < contours.size(); i++) {
       const area = cv.contourArea(contours.get(i))
       if (area > bestArea) {
@@ -107,10 +57,6 @@ export function detectPaperQuad(cv: CV, canvas: HTMLCanvasElement): [Vec2, Vec2,
     }
     if (bestIndex < 0) return null
 
-    // Convex hull, then relax the polygon approximation until 4 corners
-    // remain. If the resulting quad lost noticeable area vs the hull (e.g. a
-    // vignetted corner was missing from the mask and got cut diagonally),
-    // fall back to the minimum-area rotated rectangle around the hull.
     const hull = new cv.Mat()
     const approx = new cv.Mat()
     try {
@@ -140,20 +86,99 @@ export function detectPaperQuad(cv: CV, canvas: HTMLCanvasElement): [Vec2, Vec2,
           box.center.y + x * sin + y * cos,
         ])
       }
-      const ordered = orderCorners(pts)
-      return ordered.map(([x, y]) => [x / scale, y / scale]) as [Vec2, Vec2, Vec2, Vec2]
+      return orderCorners(pts)
     } finally {
       hull.delete()
       approx.delete()
     }
   } finally {
-    src.delete()
-    small.delete()
-    lab.delete()
-    mask?.delete()
+    maskMat.delete()
     kernel.delete()
     contours.delete()
     hierarchy.delete()
+  }
+}
+
+/**
+ * Classical paper detection (Lab similarity). Kept as fallback when paperseg.onnx
+ * is missing.
+ */
+export function detectPaperQuad(cv: CV, canvas: HTMLCanvasElement): [Vec2, Vec2, Vec2, Vec2] | null {
+  const maxDim = 900
+  const scale = Math.min(1, maxDim / Math.max(canvas.width, canvas.height))
+
+  const src = cv.imread(canvas)
+  const small = new cv.Mat()
+  const lab = new cv.Mat()
+  let maskData: Uint8Array | null = null
+  try {
+    const w = Math.round(canvas.width * scale)
+    const h = Math.round(canvas.height * scale)
+    cv.resize(src, small, new cv.Size(w, h), 0, 0, cv.INTER_AREA)
+    cv.cvtColor(small, small, cv.COLOR_RGBA2RGB)
+    cv.GaussianBlur(small, small, new cv.Size(5, 5), 0)
+    cv.cvtColor(small, lab, cv.COLOR_RGB2Lab)
+    const data = lab.data
+
+    const sampleL: number[] = []
+    const sampleA: number[] = []
+    const sampleB: number[] = []
+    for (let y = h >> 2; y < h - (h >> 2); y += 3) {
+      for (let x = w >> 2; x < w - (w >> 2); x += 3) {
+        const i = (y * w + x) * 3
+        sampleL.push(data[i])
+        sampleA.push(data[i + 1])
+        sampleB.push(data[i + 2])
+      }
+    }
+    const med = (arr: number[]) => {
+      arr.sort((a, b) => a - b)
+      return arr[arr.length >> 1]
+    }
+    const paperL = med(sampleL)
+    const paperA = med(sampleA)
+    const paperB = med(sampleB)
+
+    const lTolUp = Math.max(25, paperL * 0.15)
+    const lTolDown = Math.max(45, paperL * 0.3)
+    const abTol = 13
+    maskData = new Uint8Array(w * h)
+    for (let i = 0; i < w * h; i++) {
+      const dl = data[i * 3] - paperL
+      if (
+        dl < lTolUp &&
+        dl > -lTolDown &&
+        Math.abs(data[i * 3 + 1] - paperA) < abTol &&
+        Math.abs(data[i * 3 + 2] - paperB) < abTol
+      ) {
+        maskData[i] = 255
+      }
+    }
+    const ordered = quadFromBinaryMask(cv, maskData, w, h)
+    if (!ordered) return null
+    return ordered.map(([x, y]) => [x / scale, y / scale]) as [Vec2, Vec2, Vec2, Vec2]
+  } finally {
+    src.delete()
+    small.delete()
+    lab.delete()
+  }
+}
+
+/**
+ * Production paper corners: ONNX paper mask → quad. Falls back to classical
+ * Lab detection if the model is missing or inference fails.
+ */
+export async function detectPaperQuadNn(
+  cv: CV,
+  canvas: HTMLCanvasElement,
+): Promise<[Vec2, Vec2, Vec2, Vec2] | null> {
+  try {
+    await loadPaperSegSession()
+    const { mask, width, height } = await segmentPaperNn(canvas)
+    return quadFromBinaryMask(cv, mask, width, height)
+  } catch (err) {
+    console.warn('paperseg.onnx unavailable; falling back to classical paper detection', err)
+    return detectPaperQuad(cv, canvas)
   }
 }
 

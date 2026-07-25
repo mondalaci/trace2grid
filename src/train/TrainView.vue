@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref, triggerRef, watch } from 'vue'
-import { extractToolContours, type ExtractedContour } from '../lib/scan/contours'
+import { type ExtractedContour } from '../lib/scan/contours'
+import { extractToolContoursNn } from '../lib/scan/nnSeg'
 import { loadOpenCV } from '../lib/scan/opencv'
 import {
   classifyPaper,
-  detectPaperQuad,
+  detectPaperQuadNn,
   PAPER_SIZES,
   paperById,
   rectifyPaper,
@@ -226,7 +227,7 @@ async function selectPhoto(name: string) {
       busy.value = 'Detecting paper…'
       const cv = await loadOpenCV()
       await new Promise((r) => setTimeout(r))
-      const quad = detectPaperQuad(cv, canvas)
+      const quad = await detectPaperQuadNn(cv, canvas)
       corners.value = quad ?? [
         [canvas.width * 0.1, canvas.height * 0.1],
         [canvas.width * 0.9, canvas.height * 0.1],
@@ -291,7 +292,7 @@ async function redetectCorners() {
   try {
     const cv = await loadOpenCV()
     await new Promise((r) => setTimeout(r))
-    const quad = detectPaperQuad(cv, photoCanvas.value)
+    const quad = await detectPaperQuadNn(cv, photoCanvas.value)
     if (quad) corners.value = quad
     else error.value = 'Auto-detection found no paper'
   } finally {
@@ -543,7 +544,7 @@ async function runExtraction() {
   const canvas = rectifiedCanvas.value
   const cv = await loadOpenCV()
   if (epoch !== truthEpoch || canvas !== rectifiedCanvas.value) return
-  detected.value = extractToolContours(cv, canvas, {
+  detected.value = await extractToolContoursNn(cv, canvas, {
     pxPerMm: PX_PER_MM,
     sensitivity: sensitivity.value,
   })

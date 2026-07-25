@@ -15,8 +15,8 @@ Turn a photo of your tools into a 3D-printable [Gridfinity](https://gridfinity.x
 | Concern | Library |
 | --- | --- |
 | UI | Vue 3 + TypeScript + Vite + Pinia |
-| Paper detection, rectification, contours | OpenCV.js (WASM, lazy-loaded) |
-| Neural tool segmentation (optional) | TinyUNet ONNX via onnxruntime-web (WebGPU/WASM) |
+| Paper corners | TinyUNet ONNX (`paperseg`); OpenCV for mask→quad + warp; classical Lab fallback |
+| Tool segmentation | TinyUNet ONNX (`toolseg`); classical OpenCV path kept for eval |
 | Solid modeling (bin, pockets, offsetting) | manifold-3d (WASM CSG, in a Web Worker) |
 | 3D preview | three.js |
 | PDF export | jsPDF |
@@ -57,7 +57,12 @@ Each run appends rows to `training/accuracy-log.csv` (`timestamp`, `file`, `accu
 
 ### Neural segmentation (GPU train → browser ONNX)
 
-Classical OpenCV tops out around ~83% mean IoU on harsh contact shadows. To go further, train a small U-Net on the labeled photos (your GPU) and export ONNX for client-side inference:
+Capture uses two TinyUNet ONNX models in `public/models/` (committed; regenerate with `npm run ml` after better labels):
+
+- `paperseg.onnx` — paper sheet mask → four corners
+- `toolseg.onnx` — tool silhouettes on the rectified sheet
+
+Classical OpenCV contour scoring remains on `eval.html` for A/B.
 
 ```bash
 cd ml && python3 -m venv .venv && source .venv/bin/activate
@@ -71,7 +76,6 @@ See [`ml/README.md`](ml/README.md) for details. With only a handful of labels, t
 ## Tips for good scans
 
 - Strong, even light; avoid hard shadows next to tools (or lower the sensitivity slider).
-- Detection compares each pixel's color and brightness against the paper, so colored or dark tools work best; pale gray tools on white paper may need the sensitivity slider raised.
-- Soft shadows are ignored automatically, but harsh directional light casts near-black contact shadows that can't be told apart from the tool — prefer diffuse, even light.
+- Colored or dark tools on white paper work best; the neural detector still struggles with pale gray tools that blend into the sheet.
 - Shoot from directly overhead. Tall tools "grow" slightly in the photo due to parallax — that's what the per-tool clearance and the 1:1 PDF check are for.
 - Distance helps: the farther the camera, the smaller the perspective error from tool height. Step back and zoom in, ideally with a telephoto lens (2–3× on most phones).

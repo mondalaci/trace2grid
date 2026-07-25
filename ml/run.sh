@@ -19,23 +19,30 @@ fi
 cmd="${1:-}"
 shift || true
 
+train_both() {
+  local mode_args=("$@")
+  "$PY" train.py --task tools "${mode_args[@]}"
+  "$PY" train.py --task paper "${mode_args[@]}"
+}
+
 case "$cmd" in
   prepare)
-    exec "$PY" prepare_dataset.py "$@"
+    exec "$PY" prepare_dataset.py --task both "$@"
     ;;
   train)
-    # Documented default: LOO + full fit
-    exec "$PY" train.py --mode both --epochs 80 --repeats 48 "$@"
+    # Documented default: LOO + full fit for tools and paper
+    train_both --mode both --epochs 80 --repeats 48 "$@"
     ;;
   train-quick)
-    # Faster smoke (~15–20 min on an RTX 5080 with n=4)
-    exec "$PY" train.py --mode both --epochs 40 --repeats 32 "$@"
+    # Faster smoke (~15–20 min per task on an RTX 5080 with n=4)
+    train_both --mode both --epochs 40 --repeats 32 "$@"
     ;;
   export)
-    "$PY" export_onnx.py "$@"
+    "$PY" export_onnx.py --task both "$@"
     mkdir -p ../public/models
     cp -f export/toolseg.onnx export/toolseg.json ../public/models/
-    echo "Copied export/toolseg.{onnx,json} → public/models/"
+    cp -f export/paperseg.onnx export/paperseg.json ../public/models/
+    echo "Copied export/{tool,paper}seg.{onnx,json} → public/models/"
     ;;
   all)
     "$SELF" prepare
@@ -50,10 +57,10 @@ case "$cmd" in
   *)
     echo "Usage: $SELF <prepare|train|train-quick|export|all|all-quick> [args...]"
     echo
-    echo "  prepare      rebuild ml/dataset from training/*.jpg(+.json)"
-    echo "  train        LOO+full, epochs=80 repeats=48 (~45–60 min @ n=4)"
-    echo "  train-quick  LOO+full, epochs=40 repeats=32 (~20 min @ n=4)"
-    echo "  export       ONNX → ml/export/ and public/models/"
+    echo "  prepare      rebuild tool + paper datasets from training/"
+    echo "  train        LOO+full for tools and paper (~45–60 min each @ n=4)"
+    echo "  train-quick  LOO+full, epochs=40 repeats=32 per task"
+    echo "  export       ONNX → ml/export/ and public/models/ (toolseg + paperseg)"
     echo "  all          prepare + train + export"
     echo "  all-quick    prepare + train-quick + export"
     exit 1

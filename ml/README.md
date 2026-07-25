@@ -1,16 +1,25 @@
-# Neural tool segmentation (train on GPU, infer in browser via ONNX)
+# Neural segmentation (train on GPU, infer in browser via ONNX)
 
-Train a small U-Net on labeled `training/` photos, export ONNX, and (next)
-run it client-side with `onnxruntime-web` (WebGPU).
+Two TinyUNet models, both trained from `training/` labels and run
+client-side with `onnxruntime-web` (WebGPU):
+
+| Model | Input | Label source | Browser |
+| --- | --- | --- | --- |
+| `toolseg.onnx` | Rectified paper | Tool outlines (`truth`) | `extractToolContoursNn` |
+| `paperseg.onnx` | Full photo | Paper corners polygon | `detectPaperQuadNn` |
+
+Capture uses both by default. Classical OpenCV Lab paper detection remains as
+a fallback if `paperseg.onnx` is missing; classical tool contours stay on
+`eval.html` for A/B.
 
 ## npm shortcuts (from repo root)
 
 Prefer these over raw Python once `ml/.venv` exists:
 
 ```bash
-npm run ml:prepare       # rebuild dataset from training/
-npm run ml:train:quick   # LOO+full, 40 ep / 32 repeats (~20 min)
-npm run ml:train         # LOO+full, 80 ep / 48 repeats (~45–60 min)
+npm run ml:prepare       # rebuild tool + paper datasets from training/
+npm run ml:train:quick   # LOO+full for both tasks (~20 min each)
+npm run ml:train         # LOO+full for both (~45–60 min each)
 npm run ml:export        # ONNX → ml/export/ and public/models/
 npm run ml:quick         # prepare + train-quick + export
 npm run ml               # prepare + train + export
@@ -18,6 +27,7 @@ npm run ml               # prepare + train + export
 
 Same thing via `ml/run.sh <prepare|train|train-quick|export|all|all-quick>`.
 Extra `train.py` flags pass through, e.g. `npm run ml:train -- --epochs 20`.
+Train a single task with `python train.py --task paper …`.
 
 ## Setup (RTX / CUDA)
 
@@ -32,25 +42,29 @@ pip install -r requirements.txt
 
 ## Prepare dataset
 
-Rectifies each labeled photo (same corners / `pxPerMm=4` as the app) and
-writes `image.png` + `mask.png`. Degenerate truth polys under 20 mm² are dropped.
-
 ```bash
-python prepare_dataset.py
-# → ml/dataset/<id>/{image,mask}.png + manifest.json
+python prepare_dataset.py --task both
+# tools → ml/dataset/<id>/{image,mask}.png   (rectified RGB + tool masks)
+# paper → ml/dataset_paper/<id>/{image,mask}.png  (full photo + corner-quad mask)
 ```
+
+Tool masks drop degenerate truth polys under 20 mm².
 
 ## Train
 
 Leave-one-out (honest score with n=4) and a full overfit fit:
 
 ```bash
-python train.py --mode both --epochs 80 --repeats 48
+python train.py --task tools --mode both --epochs 80 --repeats 48
+python train.py --task paper --mode both --epochs 80 --repeats 48
 # faster smoke test:
-python train.py --mode loo --epochs 20 --repeats 16
+python train.py --task paper --mode loo --epochs 20 --repeats 16
 ```
 
-Artifacts: `ml/runs/loo/<holdout>/best.pt`, `ml/runs/full/best.pt`, `ml/runs/summary.json`.
+Artifacts:
+
+- tools: `ml/runs/loo/<holdout>/best.pt`, `ml/runs/full/best.pt`
+- paper: `ml/runs/paper/loo/…`, `ml/runs/paper/full/best.pt`
 
 With only 4 images, **LOO mean IoU** is the number to trust; full-fit train IoU
 will look almost perfect (memorization).
@@ -58,13 +72,13 @@ will look almost perfect (memorization).
 ## Export ONNX
 
 ```bash
-python export_onnx.py --checkpoint runs/full/best.pt
-# → ml/export/toolseg.onnx (+ toolseg.json metadata)
+python export_onnx.py --task both
+# → ml/export/toolseg.onnx + paperseg.onnx (+ .json metadata)
 ```
 
-Copy `toolseg.onnx` (+ `toolseg.json`) into `public/models/` for the browser
-loader in `src/lib/scan/nnSeg.ts` (`segmentToolsNn`). ONNX weights are
-gitignored (large); rebuild with `npm run ml:export` after training.
+Copy both into `public/models/` (`npm run ml:export` does this). The `.onnx`
+weights are committed so capture works after a fresh clone; re-export and
+commit after retraining.
 
 ## Expected client performance
 
@@ -73,9 +87,9 @@ gitignored (large); rebuild with `npm run ml:export` after training.
 | WebGPU (desktop) | ~15–60 ms |
 | WASM CPU | ~0.3–1.5 s |
 
-Model is TinyUNet (`--base 32`, ~8 M params, ~30 MB FP32 ONNX).
+Model is TinyUNet (`--base 32`, ~8 M params, ~30 MB FP32 ONNX each).
 
-## First run on the 4 labeled photos (RTX 5080)
+## First run on the 4 labeled photos (RTX 5080, tools)
 
 | Metric | IoU |
 | --- | --- |
@@ -83,4 +97,5 @@ Model is TinyUNet (`--base 32`, ~8 M params, ~30 MB FP32 ONNX).
 | LOO knifes / nose-plier / precision / red | 78.3% / 58.5% / 88.3% / 94.2% |
 | Full-fit (train=val, overfit monitor) | **91.3%** |
 
-LOO below the classical ~83% mean is expected with n=4 — the held-out photo is a different tool family. Add more labels, then re-run `train.py`; trust LOO, not full-fit.
+LOO below classical tool scores is expected with n=4 — the held-out photo is a
+different tool family. Add more labels, then re-run; trust LOO, not full-fit.
